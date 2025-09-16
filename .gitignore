@@ -34,11 +34,7 @@ Thumbs.db
 *.log
 *.sqlite3
 
-# Stamp files
-Archive/
-Inbox/
-Listings/
-Masters/
-OCR/
-Slices/
-Workflow/
+# Stamps
+Stamps/Inbox/*
+Stamps/Slices/*
+Stamps/Workflow/*/*.jpg
