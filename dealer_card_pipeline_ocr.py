@@ -393,8 +393,8 @@ def process_scan(scan_path: str, out_dir: str, rotate_mode: str):
     return final_paths, rows, json_dump
 
 def iter_images(path: pathlib.Path, recursive: bool = False):
-    """Yield absolute paths to JPG/JPEG/PNG under path (file or folder)."""
-    exts = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
+    """Yield absolute paths to JPG/JPEG/TIFF/PNG under path (file or folder)."""
+    exts = {".jpg", ".jpeg", ".tiff", ".png", ".JPG", ".JPEG", ".TIFF", ".PNG"}
     path = path.resolve()
     if path.is_file():
         if path.suffix in exts:

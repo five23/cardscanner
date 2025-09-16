@@ -1,0 +1,44 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Editor/IDE specific files
+.vscode/
+.idea/
+*.swp
+*.bak
+*.swo
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.coverage
+.coverage.*
+.pytest_cache/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Other common exclusions
+*.log
+*.sqlite3
+
+# Stamp files
+Archive/
+Inbox/
+Listings/
+Masters/
+OCR/
+Slices/
+Workflow/
