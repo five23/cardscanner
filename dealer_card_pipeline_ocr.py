@@ -24,8 +24,77 @@ BIN_THR_PCT = (5, 95)      # percentile stretch for contrast (clip darkest/light
 # -----------------------------
 # Helper functions
 # -----------------------------
+import math
 
-# ---------- ROI-based OCR for dealer cards ----------
+LOOKALIKE_MAP = str.maketrans({
+    "O": "0", "o": "0",
+    "I": "1", "l": "1", "|": "1",
+    "S": "5", "s": "5",
+    "Z": "2", "z": "2"
+})
+
+def _clean_ascii(s: str) -> str:
+    # strip curly quotes/dashes/odd glyphs Tesseract invents
+    return re.sub(r"[^\w\-\s#$.,/]", "", s)
+
+def _normalize_digits(s: str) -> str:
+    # translate look-alikes only inside number-like runs
+    def fix(m): return m.group(0).translate(LOOKALIKE_MAP)
+    return re.sub(r"([$]?\s*[A-Za-z]*\d[\dOIlSsz.,]*)", fix, s)
+
+def _extract_amount(txt: str):
+    t = _normalize_digits(_clean_ascii(txt)).replace(" ", "").replace(",", ".")
+    m = re.search(r"\$?\d+(?:\.\d{1,2})?", t)
+    if not m: return None
+    amt = m.group(0).lstrip("$")
+    if "." not in amt: amt += ".00"
+    return f"${amt}"
+
+def _tess(img_bin, psm=6, allow=None, lang=TESS_LANGS, oem=1):
+    import pytesseract
+    config = f"--oem {oem} --psm {psm}"
+    if allow:
+        allow_sanitized = allow.replace(" ", "")
+        # quote the -c value so spaces (if any) don't break parsing
+        config += f" -c \"tessedit_char_whitelist={allow_sanitized}\""
+    return pytesseract.image_to_string(img_bin, config=config, lang=lang).strip()
+
+def _prep_text(bgr, invert=False):
+    """Robust binarization for faint pencil on card stock."""
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    # gentle contrast stretch
+    lo, hi = np.percentile(g, (5, 95))
+    if hi > lo:
+        g = np.clip((g - lo) * (255.0/(hi - lo)), 0, 255).astype(np.uint8)
+    g = cv2.medianBlur(g, 3)
+
+    # try adaptive Gaussian; if very low variance, fall back to Otsu/Sauvola
+    thr = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 31, 9)
+    # thicken strokes slightly
+    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), 1)
+
+    # If too sparse, fallback to Otsu
+    if (thr == 255).mean() > 0.96 or (thr == 0).mean() > 0.96:
+        _, thr = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), 1)
+
+    if invert: thr = 255 - thr
+    # upsample small headers for Tesseract
+    thr = _upsample_to_height(thr, target_h=70)
+    return thr
+
+def _read_best(img_bgr, psms, allow, oems=(1,)):  # LSTM only
+    candidates = []
+    for inv in (False, True):
+        binimg = _prep_text(img_bgr, invert=inv)
+        for psm in psms:
+            for oem in oems:
+                txt = _tess(binimg, psm=psm, allow=allow, oem=oem)
+                score = len(re.findall(r"[A-Za-z0-9#$.\-]", txt)) - 0.5*len(re.findall(r"[_~^`]", txt))
+                candidates.append((score, txt))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
 
 def _roi(img, x0, y0, x1, y1):
     """Crop by fractional coordinates (0..1)."""
@@ -34,98 +103,64 @@ def _roi(img, x0, y0, x1, y1):
     X1, Y1 = int(x1*w), int(y1*h)
     return img[Y0:Y1, X0:X1].copy()
 
-def _prep_text(bgr, invert=False):
-    """High-contrast binarization for handwriting/print."""
-    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    # light stretch
-    lo, hi = np.percentile(g, (5, 95))
-    if hi > lo:
-        g = np.clip((g - lo) * (255.0/(hi - lo)), 0, 255).astype(np.uint8)
-    # adaptive threshold works well on the card stock
-    thr = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY, 31, 9)
-    if invert:
-        thr = 255 - thr
-    return thr
+def _upsample_to_height(img_bin, target_h=64):
+    h, w = img_bin.shape[:2]
+    if h >= target_h: return img_bin
+    scale = target_h / float(h)
+    return cv2.resize(img_bin, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
 
-def _tess(img_bin, psm=6, allow=None, lang=TESS_LANGS):
-    import pytesseract
-    config = f"--oem 1 --psm {psm}"
-    if allow:
-        # whitelist characters (handy for prices and years)
-        config += f" -c tessedit_char_whitelist={allow}"
-    return pytesseract.image_to_string(img_bin, config=config, lang=lang).strip()
-
+# -----------------------------
+# ROI-based OCR (replace your ocr_card_structured with this)
+# -----------------------------
 def ocr_card_structured(img_path: pathlib.Path, debug=False, out_dir=None):
-    """
-    Read key fields from a processed card:
-      - condition (MNH/MLH/MVLH or blank = Used)
-      - year (4 digits, top-left)
-      - scott (e.g., #MH287 or 123, A12a, etc.)
-      - cat_price (e.g., $1.60)
-      - sell_price (e.g., $1.00)
-    Returns dict with fields + raw_texts.
-    """
     bgr = cv2.imread(str(img_path))
     h, w = bgr.shape[:2]
 
-    # --- ROIs (fractions of width/height) ---
-    # Adjust if needed; these work for the examples you shared.
+    # ROIs (tuned to your cards)
     ROIS = {
-        "condition": (0.02, 0.01, 0.25, 0.11),   # top-left corner strip
-        "year":      (0.02, 0.10, 0.25, 0.20),   # just below condition
-        "scott":     (0.28, 0.02, 0.62, 0.14),   # centered top
-        # right third; we'll read two prices from left->right
+        "condition": (0.02, 0.01, 0.25, 0.11),
+        "year":      (0.02, 0.10, 0.25, 0.20),
+        "scott":     (0.24, 0.02, 0.68, 0.14),   # a bit wider for #B100-B102
         "prices":    (0.62, 0.02, 0.98, 0.16),
     }
-
     crops = {k: _roi(bgr, *ROIS[k]) for k in ROIS}
 
-    # Preprocess for OCR
-    bin_condition = _prep_text(crops["condition"])
-    bin_year      = _prep_text(crops["year"])
-    bin_scott     = _prep_text(crops["scott"])
-    bin_prices    = _prep_text(crops["prices"])
+    # --- OCR with field-specific configs ---
+    cond_txt  = _read_best(crops["condition"], psms=(8,7), allow="MNVLHU usedUSED ")
+    year_txt  = _read_best(crops["year"],      psms=(8,7), allow="0123456789")
+    scott_raw = _read_best(crops["scott"],     psms=(7,8), allow="#-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ ")
 
-    # --- OCR with targeted settings ---
-    cond_txt = _tess(bin_condition, psm=7)  # single line
-    year_txt = _tess(bin_year,      psm=7, allow="0123456789")  # digits only
-    scott_txt= _tess(bin_scott,     psm=7)  # single line, mixed chars
-    prices_txt=_tess(bin_prices,    psm=6, allow="$0123456789.,")  # a couple of numbers
+    # prices: split into Cat. (left) and Selling (right)
+    pr = crops["prices"]
+    midx = pr.shape[1] // 2
+    left, right = pr[:, :midx], pr[:, midx:]
+    cat_raw  = _read_best(left,  psms=(7,8), allow="$0123456789., ")
+    sell_raw = _read_best(right, psms=(7,8), allow="$0123456789., ")
 
-    # --- Parse/cleanup ---
-    # condition normalization
+    # --- Parse/normalize ---
+    # condition
+    up = cond_txt.upper().replace(" ", "")
     cond_norm = None
-    for token in ["MNH", "MLH", "MVLH"]:
-        if token in cond_txt.upper():
-            cond_norm = token
-            break
-    if cond_norm is None and cond_txt.strip() == "":
-        cond_norm = "Used"  # your convention when left blank
+    for tok in ("MNH", "MVLH", "MLH"):
+        if tok in up:
+            cond_norm = tok; break
+    if cond_norm is None:
+        cond_norm = "Used" if up == "" else None
 
-    # year: first 4-digit number that looks like a year 1800–2099
-    year = None
-    m = re.search(r"\b(18|19|20)\d{2}\b", year_txt)
-    if m:
-        year = m.group(0)
+    # year
+    y = _clean_ascii(year_txt)
+    m = re.search(r"\b(18|19|20)\d{2}\b", y)
+    year = m.group(0) if m else None
 
-    # scott: accept formats like MH287, #123, A12a, 123-125 etc.
-    scott = None
-    m = re.search(r"(?:#\s*)?([A-Z]{0,3}\d+[A-Za-z]?(-\d+[A-Za-z]?)?)", scott_txt.strip())
-    if m:
-        scott = m.group(1)
+    # Scott: accept #B100-B102, B100-102, MH239, A12a
+    s_clean = _normalize_digits(_clean_ascii(scott_raw)).upper()
+    # common fix: BIOO -> B100 etc handled by _normalize_digits
+    m = re.search(r"(?:#\s*)?([A-Z]{0,3}\d{1,4}(?:[A-Z]|-(?:[A-Z]?\d{1,4}))?)", s_clean)
+    scott = m.group(1) if m else None
 
-    # prices: try to pull two amounts, left-to-right
-    amounts = re.findall(r"\$?\s*\d+(?:[.,]\d{2})?", prices_txt)
-    amounts = [a.replace(" ", "").replace(",", ".") for a in amounts]
-    # normalize to $X.YY format if possible
-    def norm_price(a):
-        a = a.lstrip("$")
-        if "." not in a:
-            a = f"{a}.00"
-        return f"${a}"
-    cat_price = norm_price(amounts[0]) if len(amounts) >= 1 else None
-    sell_price= norm_price(amounts[1]) if len(amounts) >= 2 else None
+    # prices
+    cat_price  = _extract_amount(cat_raw)
+    sell_price = _extract_amount(sell_raw)
 
     if debug and out_dir:
         vis = bgr.copy()
@@ -134,14 +169,15 @@ def ocr_card_structured(img_path: pathlib.Path, debug=False, out_dir=None):
             cv2.rectangle(vis, (X0,Y0), (X1,Y1), (0,255,0), 3)
             cv2.putText(vis, k, (X0, max(0,Y0-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
         cv2.imwrite(str(pathlib.Path(out_dir)/f"{img_path.stem}_roi_debug.jpg"), vis)
-        cv2.imwrite(str(pathlib.Path(out_dir)/f"{img_path.stem}_roi_prices_bin.png"), bin_prices)
 
     return {
         "condition_raw": cond_txt, "condition": cond_norm,
-        "year_raw": year_txt,       "year": year,
-        "scott_raw": scott_txt,     "scott": scott,
-        "prices_raw": prices_txt,   "cat_price": cat_price, "sell_price": sell_price,
+        "year_raw": year_txt,      "year": year,
+        "scott_raw": scott_raw,    "scott": scott,
+        "prices_raw": f"{cat_raw} | {sell_raw}",
+        "cat_price": cat_price,    "sell_price": sell_price,
     }
+
 
 def rotate_90(img_bgr, mode="cw"):
     """Rotate an image 90° clockwise or counter-clockwise."""
@@ -298,6 +334,7 @@ def detect_and_crop(src_path: str, out_dir: str, rotate_mode: str, debug=False):
         paths.append(tmp)
 
     return paths
+
 # -----------------------------
 # Step 2: Run Photoshop Action
 # -----------------------------
@@ -392,22 +429,21 @@ def process_scan(scan_path: str, out_dir: str, rotate_mode: str):
 
     return final_paths, rows, json_dump
 
+# -----------------------------
+# iter_images (make suffix check case-insensitive)
+# -----------------------------
 def iter_images(path: pathlib.Path, recursive: bool = False):
     """Yield absolute paths to JPG/JPEG/TIFF/PNG under path (file or folder)."""
-    exts = {".jpg", ".jpeg", ".tiff", ".png", ".JPG", ".JPEG", ".TIFF", ".PNG"}
+    exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
     path = path.resolve()
     if path.is_file():
-        if path.suffix in exts:
+        if path.suffix.lower() in exts:
             yield path
         return
-    if recursive:
-        for p in sorted(path.rglob("*")):
-            if p.suffix in exts:
-                yield p
-    else:
-        for p in sorted(path.glob("*")):
-            if p.suffix in exts:
-                yield p
+    globber = path.rglob if recursive else path.glob
+    for p in sorted(globber("*")):
+        if p.suffix.lower() in exts:
+            yield p
 
 def append_rows_csv(csv_path: pathlib.Path, rows: list, header: list):
     """Append rows to CSV, writing header only if the file doesn’t exist yet."""
@@ -439,7 +475,7 @@ if __name__ == "__main__":
         description="Dealer card pipeline: crop → rotate → Photoshop → OCR (file or folder)"
     )
     ap.add_argument("scan", help="input scan file OR a folder containing images")
-    ap.add_argument("-o", "--out", default="cards_out", help="output folder")
+    ap.add_argument("-o", "--out", default="./Stamps/Slices", help="output folder")
     ap.add_argument("--rotate", choices=["cw", "ccw"], default=DEFAULT_ROTATE_MODE,
                     help="extra 90° rotation direction")
     ap.add_argument("--no-ocr", action="store_true", help="skip OCR")
