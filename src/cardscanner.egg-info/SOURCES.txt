@@ -1,6 +1,7 @@
 README.md
 pyproject.toml
 src/cardscanner/__init__.py
+src/cardscanner/cli.py
 src/cardscanner/config.py
 src/cardscanner/crops.py
 src/cardscanner/imaging.py

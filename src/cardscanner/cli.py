@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import argparse, pathlib
-from src.cardscanner.config import DEFAULT_ROTATE_MODE, USE_TESSERACT
-from src.cardscanner.pipeline import process_scan
-from src.cardscanner.imaging import iter_images
-from src.cardscanner.iohelpers import append_rows_csv, merge_json
+from .config import DEFAULT_ROTATE_MODE, USE_TESSERACT
+from .pipeline import process_scan
+from .imaging import iter_images
+from .iohelpers import append_rows_csv, merge_json
 
 def main():
     ap = argparse.ArgumentParser(description="Dealer card pipeline")

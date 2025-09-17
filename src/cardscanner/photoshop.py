@@ -1,8 +1,8 @@
 import pathlib
 import subprocess
 
-from cardscanner.config import (
-    ACTION_NAME, ACTION_SET, PHOTOSHOP_BUNDLE_ID
+from .config import (
+    ACTION_NAME, ACTION_SET, PHOTOSHOP_BUNDLE_ID, JPEG_QUALITY
 )
 
 def _esc_js_path(p: pathlib.Path) -> str:

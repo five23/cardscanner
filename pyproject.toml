@@ -12,4 +12,4 @@ dependencies = [
 ]
 
 [project.scripts]
-cardscanner = "cli:main"
+cardscanner = "cardscanner.cli:main"

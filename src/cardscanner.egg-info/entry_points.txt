@@ -1,2 +1,2 @@
 [console_scripts]
-cardscanner = cli:main
+cardscanner = cardscanner.cli:main
