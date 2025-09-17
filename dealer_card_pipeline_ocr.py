@@ -1,7 +1,29 @@
 #!/usr/bin/env python3
-import os, re, csv, json, subprocess, pathlib
-import cv2, numpy as np
+import os
+import re
+import csv
+import json
+import subprocess
+import pathlib
+import cv2
+import numpy as np
 from PIL import Image
+import base64
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
+
+client = OpenAI()
+
+# -----------------------------
+# Config: choose OCR source
+# -----------------------------
+# "micro"  -> Tesseract on microcrops (recommended)
+# "full"   -> Tesseract on whole header band via ROI (your current ocr_card_structured)
+# "ai"     -> OpenAI JSON schema on microcrops (ai_read_from_microcrops)
+OCR_SOURCE = "micro"             # "micro" | "full" | "ai"
+AI_MODEL   = "gpt-4.1"           # used only if OCR_SOURCE == "ai"
 
 # -----------------------------
 # Photoshop configuration
@@ -21,17 +43,105 @@ DEFAULT_ROTATE_MODE = "cw" # default if user doesn’t specify
 DPI_FOR_OCR = 300          # upsample images to simulate this DPI for OCR
 BIN_THR_PCT = (5, 95)      # percentile stretch for contrast (clip darkest/lightest ends)
 
-# -----------------------------
-# Helper functions
-# -----------------------------
-import math
 
+# Map of common OCR misreads (letters to digits)
 LOOKALIKE_MAP = str.maketrans({
     "O": "0", "o": "0",
     "I": "1", "l": "1", "|": "1",
     "S": "5", "s": "5",
     "Z": "2", "z": "2"
 })
+
+# This is the band where the header (Scott #, prices, condition) is expected
+HEADER_BAND = (0.0, 0.0, 1.0, 0.2)
+HEADER_LEFT = (0.00, 0.00, 0.18, 0.8)
+HEADER_SCOTT = (0.18, 0.00, 0.53, 0.8)
+HEADER_PRICE = (0.52, 0.00, 1.00, 1.0)
+
+# inside price block:
+PRICE_CAT    = (0.00, 0.00, 0.45, 1.00)
+PRICE_SELL   = (0.45, 0.00, 1.00, 1.00)
+
+
+SCHEMA = {
+  "type": "object",
+  "properties": {
+    "condition": {"type":"string", "enum":["MNH","MLH","MVLH","Used",""]},
+    "year":      {"type":"string"},      # "1976" or ""
+    "scott":     {"type":"string"},      # "#681-682" or "MH239" or ""
+    "cat_price": {"type":"string"},      # "$1.30" or ""
+    "sell_price":{"type":"string"}       # "$1.00" or ""
+  },
+  "required": ["condition","year","scott","cat_price","sell_price"],
+  "additionalProperties": False
+}
+
+def ai_read_from_microcrops(micro: dict, model="gpt-4o-mini"):
+    """
+    micro: {"left": Path, "scott": Path, "cat": Path, "sell": Path}
+    Returns dict matching SCHEMA.
+    """
+    imgs = [
+        _img_part(micro["left"]),
+        _img_part(micro["scott"]),
+        _img_part(micro["cat"]),
+        _img_part(micro["sell"]),
+    ]
+
+    prompt = (
+      "Extract five fields from these crops of a dealer card header:\n"
+      "- left: condition (MNH/MLH/MVLH or blank=Used) and 4-digit year\n"
+      "- scott: e.g., #681-682, 2341a, MH239\n"
+      "- cat: catalog price like $1.30\n"
+      "- sell: selling price like $1.00\n"
+      "Return strictly the schema; use empty string if unreadable."
+    )
+
+    try:
+        res = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role":"system","content":"You are a precise OCR parser. Output must match the schema exactly."},
+                {"role":"user","content":[{"type":"text","text":prompt}, *imgs]}
+            ],
+            response_format={
+                "type":"json_schema",
+                "json_schema":{"name":"card_fields","schema":SCHEMA,"strict":True}
+            }
+        )
+        meta = res.choices[0].message.parsed
+        return meta
+    except Exception as e:
+        # Fallback: use plain JSON object if schema isn’t supported
+        res = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role":"system","content":"You are a precise OCR parser. Output valid JSON only."},
+                {"role":"user","content":[{"type":"text","text":prompt}, *imgs]}
+            ],
+            response_format={"type":"json_object"}
+        )
+        raw = res.choices[0].message.content
+        # be defensive if content comes back as a list
+        if isinstance(raw, list):
+            raw = "".join(part.get("text","") for part in raw if part.get("type")=="text")
+        meta = json.loads(raw)
+        # ensure keys exist (schema shape)
+        for k in ("condition","year","scott","cat_price","sell_price"):
+            meta.setdefault(k, "")
+        return meta
+
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+def _img_part(path: pathlib.Path):
+    # pick a sensible MIME (JPEG default)
+    ext = path.suffix.lower()
+    mime = "image/png" if ext in {".png"} else "image/jpeg"
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
 
 def _clean_ascii(s: str) -> str:
     # strip curly quotes/dashes/odd glyphs Tesseract invents
@@ -109,9 +219,57 @@ def _upsample_to_height(img_bin, target_h=64):
     scale = target_h / float(h)
     return cv2.resize(img_bin, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
 
-# -----------------------------
-# ROI-based OCR (replace your ocr_card_structured with this)
-# -----------------------------
+def ocr_from_microcrops(micro: dict):
+    """
+    micro: {"left": Path, "scott": Path, "cat": Path, "sell": Path}
+    Returns a dict compatible with CSV/JSON rows.
+    """
+    # read each crop (already grayscale on disk)
+    left  = cv2.imread(str(micro["left"]),  cv2.IMREAD_GRAYSCALE)
+    scott = cv2.imread(str(micro["scott"]), cv2.IMREAD_GRAYSCALE)
+    cat   = cv2.imread(str(micro["cat"]),   cv2.IMREAD_GRAYSCALE)
+    sell  = cv2.imread(str(micro["sell"]),  cv2.IMREAD_GRAYSCALE)
+
+    # reuse your binarizer/upscaler and _tess wrapper
+    def _best_txt(gray, psms, allow):
+        # adapt to _prep_text signature (expects BGR), so fake a BGR for reuse
+        bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        return _read_best(bgr, psms=psms, allow=allow)
+
+    cond_txt  = _best_txt(left,  psms=(8,7), allow="MNVLHU usedUSED ")
+    year_txt  = _best_txt(left,  psms=(8,7), allow="0123456789")  # year is also on left
+    scott_raw = _best_txt(scott, psms=(7,8), allow="#-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ ")
+    cat_raw   = _best_txt(cat,   psms=(7,8), allow="$0123456789., ")
+    sell_raw  = _best_txt(sell,  psms=(7,8), allow="$0123456789., ")
+
+    # --- Parse/normalize (same logic as ocr_card_structured) ---
+    up = cond_txt.upper().replace(" ", "")
+    cond_norm = None
+    for tok in ("MNH", "MVLH", "MLH"):
+        if tok in up:
+            cond_norm = tok; break
+    if cond_norm is None:
+        cond_norm = "Used" if up == "" else None
+
+    y = _clean_ascii(year_txt)
+    m_year = re.search(r"\b(18|19|20)\d{2}\b", y)
+    year = m_year.group(0) if m_year else None
+
+    s_clean = _normalize_digits(_clean_ascii(scott_raw)).upper()
+    m_scott = re.search(r"(?:#\s*)?([A-Z]{0,3}\d{1,4}(?:[A-Z]|-(?:[A-Z]?\d{1,4}))?)", s_clean)
+    scott = m_scott.group(1) if m_scott else None
+
+    cat_price  = _extract_amount(cat_raw)
+    sell_price = _extract_amount(sell_raw)
+
+    return {
+        "condition_raw": cond_txt, "condition": cond_norm,
+        "year_raw": year_txt,      "year": year,
+        "scott_raw": scott_raw,    "scott": scott,
+        "prices_raw": f"{cat_raw} | {sell_raw}",
+        "cat_price": cat_price,    "sell_price": sell_price,
+    }
+
 def ocr_card_structured(img_path: pathlib.Path, debug=False, out_dir=None):
     bgr = cv2.imread(str(img_path))
     h, w = bgr.shape[:2]
@@ -219,6 +377,70 @@ def prepare_for_ocr(bgr):
 # -----------------------------
 # Step 1: Detect and crop dealer cards
 # -----------------------------
+def _crop_rel(parent_img, rel):
+    ph, pw = parent_img.shape[:2]
+    x0,y0,x1,y1 = rel
+    X0,Y0 = int(x0*pw), int(y0*ph)
+    X1,Y1 = int(x1*pw), int(y1*ph)
+    return parent_img[Y0:Y1, X0:X1]
+
+def _crop_frac(img_bgr, frac_box):
+    h, w = img_bgr.shape[:2]
+    x0, y0, x1, y1 = frac_box
+    X0, Y0, X1, Y1 = int(x0*w), int(y0*h), int(x1*w), int(y1*h)
+    X0, Y0 = max(0, X0), max(0, Y0)
+    X1, Y1 = min(w, X1), min(h, Y1)
+    return img_bgr[Y0:Y1, X0:X1].copy()
+
+def header_microcrops(img_path: pathlib.Path, out_dir: pathlib.Path, jpeg_q=80):
+    img = cv2.imread(str(img_path))  # this is the full header JPEG you saved
+    paths = {}
+
+    left  = cv2.cvtColor(_crop_rel(img, HEADER_LEFT),  cv2.COLOR_BGR2GRAY)
+    scott = cv2.cvtColor(_crop_rel(img, HEADER_SCOTT), cv2.COLOR_BGR2GRAY)
+    price = _crop_rel(img, HEADER_PRICE)
+
+    cat   = cv2.cvtColor(_crop_rel(price, PRICE_CAT),  cv2.COLOR_BGR2GRAY)
+    sell  = cv2.cvtColor(_crop_rel(price, PRICE_SELL), cv2.COLOR_BGR2GRAY)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for key, arr in {"left":left, "scott":scott, "cat":cat, "sell":sell}.items():
+        p = out_dir / f"{img_path.stem}_{key}.jpg"
+        cv2.imwrite(str(p), arr, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q])
+        paths[key] = p
+    return paths
+
+def make_header_crop(src_path: pathlib.Path,
+                     dest_dir: pathlib.Path,
+                     band=HEADER_BAND,
+                     long_edge=1000,
+                     jpeg_quality=78):
+    """
+    From a full dealer-card image, make a small grayscale JPEG of the header band.
+    - Crops top band
+    - Converts to grayscale
+    - Resizes so the longer side is ~long_edge px
+    - Saves compressed JPEG (no EXIF)
+    Returns Path to the JPEG.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    bgr = cv2.imread(str(src_path))
+    if bgr is None:
+        raise RuntimeError(f"Cannot read image: {src_path}")
+    crop = _crop_frac(bgr, band)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+    # Resize keeping aspect ratio
+    h, w = gray.shape[:2]
+    scale = (long_edge / float(max(h, w))) if max(h, w) > long_edge else 1.0
+    if scale != 1.0:
+        gray = cv2.resize(gray, (int(round(w*scale)), int(round(h*scale))), interpolation=cv2.INTER_AREA)
+
+    # Write grayscale JPEG (strip metadata by using OpenCV/Pillow re-encode)
+    out_path = dest_dir / f"{src_path.stem}_HDR.jpg"
+    # OpenCV writes grayscale JPEGs fine; quality 0..100
+    cv2.imwrite(str(out_path), gray, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
+    return out_path
 
 def detect_and_crop(src_path: str, out_dir: str, rotate_mode: str, debug=False):
     os.makedirs(out_dir, exist_ok=True)
@@ -399,24 +621,57 @@ def process_scan(scan_path: str, out_dir: str, rotate_mode: str):
     Full pipeline:
       1. Detect and crop dealer cards
       2. Run Photoshop Action on each
-      3. OCR and save results to CSV/JSON
+      3. Make header crop (grayscale, compressed) for API use
+      4. OCR and save results to CSV/JSON
     """
     scan_path = pathlib.Path(scan_path)
     out_dir = pathlib.Path(out_dir)
     raw_paths = detect_and_crop(str(scan_path), str(out_dir), rotate_mode)
 
     final_paths = []
+    header_crops = []
+    microcrops = []
+    hdr_dir = out_dir / "AI_Crops"  # small, cheap payloads for API OCR
+
     for p in raw_paths:
         p = pathlib.Path(p)
         out_final = out_dir / f"{p.stem}_PS{p.suffix}"
         run_ps_action(p, out_final)
         final_paths.append(out_final)
 
+        hdr = make_header_crop(out_final, hdr_dir,
+                               band=HEADER_BAND,
+                               long_edge=1000,
+                               jpeg_quality=78)
+        header_crops.append(hdr)
+
+        micros_dir = hdr_dir / "micro"
+        micros = header_microcrops(hdr, micros_dir)
+        microcrops.append({"file": out_final.name, **micros})
+
     # OCR → build rows/json (no file I/O here)
     rows = []
     json_dump = {}
-    for outp in final_paths:
-        meta = ocr_card_structured(outp, debug=False, out_dir=str(out_dir))  # <-- use ROI OCR
+    for outp, micro in zip(final_paths, microcrops):
+        if OCR_SOURCE == "ai":
+            meta = ai_read_from_microcrops(
+                {"left": micro["left"], "scott": micro["scott"], "cat": micro["cat"], "sell": micro["sell"]},
+                model=AI_MODEL
+            )
+            # meta already matches SCHEMA; add *_raw placeholders for consistency
+            meta = {
+                "condition_raw": "", "year_raw": "", "scott_raw": "", "prices_raw": "",
+                "condition": meta.get("condition") or None,
+                "year": meta.get("year") or None,
+                "scott": meta.get("scott") or None,
+                "cat_price": meta.get("cat_price") or None,
+                "sell_price": meta.get("sell_price") or None,
+            }
+        elif OCR_SOURCE == "micro":
+            meta = ocr_from_microcrops(micro)
+        else:  # "full"
+            meta = ocr_card_structured(outp, debug=False, out_dir=str(out_dir))
+
         rows.append({
             "file": outp.name,
             "condition": meta.get("condition"),
@@ -427,7 +682,10 @@ def process_scan(scan_path: str, out_dir: str, rotate_mode: str):
         })
         json_dump[outp.name] = meta
 
-    return final_paths, rows, json_dump
+
+    # You can also return header_crops so the next step can call the API on them.
+    return final_paths, rows, json_dump  # header_crops available inside scope if you need it
+
 
 # -----------------------------
 # iter_images (make suffix check case-insensitive)

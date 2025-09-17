@@ -1,0 +1,6 @@
+opencv-python
+numpy
+Pillow
+python-dotenv
+pytesseract
+openai>=1.0.0
